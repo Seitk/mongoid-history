@@ -11,6 +11,7 @@ module Mongoid
             except: [:created_at, :updated_at],
             modifier_field: :modifier,
             version_field: :version,
+            current_version_field: :version,
             changes_method: :changes,
             scope: scope_name,
             track_create: false,
@@ -30,6 +31,7 @@ module Mongoid
             options[:on] = options[:on].map { |field| database_field_name(field) }.compact.uniq
           end
 
+          field options[:current_version_field].to_sym, type: Integer
           field options[:version_field].to_sym, type: Integer
 
           belongs_to_modifier_options = { class_name: Mongoid::History.modifier_class_name }
@@ -45,6 +47,27 @@ module Mongoid
           before_update :track_update if options[:track_update]
           before_create :track_create if options[:track_create]
           before_destroy :track_destroy if options[:track_destroy]
+
+          tracking_fields = (options[:on] == :all ? fields.keys : options[:on]) - [:except]
+          current_version_field_key = options[:current_version_field].to_sym
+          version_field_key = options[:version_field].to_sym
+
+          # If the model has set current version field, override the getter of the model to serve with current version
+          if current_version_field_key != version_field_key
+            tracking_fields.each do |field_key|
+              define_method field_key do
+                # Check if current version is diff from latest version
+                if (self.method(current_version_field_key).call != self.attributes[version_field_key])
+                  Rails.cache.fetch("#{self.class}:object-#{self.id}:#{field_key}:version-#{self.attributes[current_version_field_key]}", :expires_in => 24.hours) {
+                    self.redo_version(nil, self.attributes[current_version_field_key])
+                    self.attributes[field_key]
+                  }
+                else
+                  self.attributes[field_key]
+                end
+              end
+            end
+          end
 
           Mongoid::History.trackable_class_options ||= {}
           Mongoid::History.trackable_class_options[scope_name] = options
@@ -71,6 +94,14 @@ module Mongoid
       end
 
       module MyInstanceMethods
+        def current_version
+          if self.attributes[:current_version].nil?
+            self.version
+          else
+            [self.attributes[:current_version], self.version].min
+          end
+        end
+
         def history_tracks
           @history_tracks ||= Mongoid::History.tracker_class.where(
             scope: related_scope,
@@ -84,6 +115,12 @@ module Mongoid
         def undo(modifier = nil, options_or_version = nil)
           versions = get_versions_criteria(options_or_version).to_a
           versions.sort! { |v1, v2| v2.version <=> v1.version }
+
+          if options_or_version.is_a?(Hash)
+            self.attributes[:current_version] = versions.last.version
+          else
+            self.attributes[:current_version] = options_or_version
+          end
 
           versions.each do |v|
             undo_attr = v.undo_attr(modifier)
@@ -103,9 +140,16 @@ module Mongoid
           save!
         end
 
-        def redo!(modifier = nil, options_or_version = nil)
+        # Redo changes to specific version without save
+        def redo_version(modifier = nil, options_or_version = nil)
           versions = get_versions_criteria(options_or_version).to_a
           versions.sort! { |v1, v2| v1.version <=> v2.version }
+
+          if options_or_version.is_a?(Hash)
+            self.attributes[:current_version] = versions.last.version
+          else
+            self.attributes[:current_version] = options_or_version
+          end
 
           versions.each do |v|
             redo_attr = v.redo_attr(modifier)
@@ -113,9 +157,14 @@ module Mongoid
               assign_attributes(redo_attr, without_protection: true)
               save!
             else
-              update_attributes!(redo_attr)
+              self.attributes = redo_attr
             end
           end
+        end
+
+        def redo!(modifier = nil, options_or_version = nil)
+          redo_version(modifier, options_or_version)
+          save!
         end
 
         def get_embedded(name)
@@ -286,6 +335,9 @@ module Mongoid
           if track_history_for_action?(action)
             current_version = (send(history_trackable_options[:version_field]) || 0) + 1
             send("#{history_trackable_options[:version_field]}=", current_version)
+            if action == :create && history_trackable_options[:current_version_field] != history_trackable_options[:version_field]
+              send("#{history_trackable_options[:current_version_field]}=", current_version)
+            end
             Mongoid::History.tracker_class.create!(history_tracker_attributes(action.to_sym).merge(version: current_version, action: action.to_s, trackable: self))
           end
           clear_trackable_memoization
